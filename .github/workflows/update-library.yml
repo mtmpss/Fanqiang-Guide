@@ -1,0 +1,86 @@
+name: 每日更新工具资料
+
+on:
+  schedule:
+    # 22:17 UTC = 次日北京时间 06:17，避开整点。
+    - cron: '17 22 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/update-library.yml'
+      - 'config/**'
+      - 'scripts/update_upstream.py'
+      - 'scripts/build_catalog.py'
+      - 'tests/**'
+  pull_request:
+    paths:
+      - '.github/workflows/update-library.yml'
+      - 'config/**'
+      - 'scripts/update_upstream.py'
+      - 'scripts/build_catalog.py'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knowledge-library-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: 校验更新逻辑
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 读取仓库
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: 准备 Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: 运行离线测试
+        run: python -m unittest discover -s tests -v
+      - name: 校验来源映射并生成目录
+        run: python scripts/build_catalog.py
+
+  update:
+    name: 检查上游并发布目录
+    needs: verify
+    if: github.repository == 'mtmpss/Fanqiang-Guide' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - name: 读取已校验的提交
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+      - name: 准备 Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: 检查公开 GitHub 项目
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/update_upstream.py
+      - name: 生成可阅读目录和检查报告
+        run: python scripts/build_catalog.py
+      - name: 发布本次检查结果
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- data/upstream.json CATALOG.md UPDATES.md
+          if git diff --cached --quiet; then
+            echo '内容未变化，无需提交。'
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              -c commit.gpgSign=false \
+              commit -m '自动检查上游版本与项目状态'
+          git push origin HEAD:main
