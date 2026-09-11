@@ -9,8 +9,7 @@ import argparse
 import html
 import json
 import re
-from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
@@ -34,14 +33,18 @@ KINDS = {
     "library": "开发库", "directory": "资料目录", "historical": "历史项目",
 }
 REVIEW = {
-    "primary_reviewed": "已阅读第一方来源；未作安装保证",
-    "reference_only": "仅参考目录线索；项目身份未核验",
-    "historical_reference": "历史资料；未确认当前可用",
+    "primary_reviewed": "已查阅官方资料",
+    "reference_only": "仅有目录介绍，来源待核实",
+    "historical_reference": "历史资料，当前可用性待确认",
 }
 EXCLUSIONS = {
-    "missing_repository": "未填写 repository",
-    "non_github_repository": "非 GitHub 仓库",
-    "invalid_repository_mapping": "地址不是有效的 GitHub 根仓库",
+    "missing_repository": "请在资料页查看官网或其他来源",
+    "non_github_repository": "请在资料页查看项目网站",
+    "invalid_repository_mapping": "项目地址待核实，请先阅读资料页",
+}
+CATEGORY_ANCHORS = {
+    "client": "clients", "core": "cores", "protocol": "protocols",
+    "concept": "concepts", "firmware": "router-firmware", "router_plugin": "router-plugins",
 }
 
 
@@ -189,10 +192,12 @@ def date_text(value):
     if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?", value):
         return "时间未记录"
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return "时间无效"
-    return cell(value)
+    if len(value) == 10:
+        return value
+    return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M") + "（北京时间）"
 
 
 def release_url(value):
@@ -221,15 +226,15 @@ def card_link(entity):
 
 def repo_observation(row, detailed=False):
     if row is None:
-        return "尚未检查"
+        return "暂未取得项目信息"
     status = row["repository_status"]
     data = row.get("repository")
     if status == "ok":
-        prefix = "检查成功：" + date_text(row.get("checked_at"))
+        prefix = "信息更新于 " + date_text(row.get("checked_at")) if detailed else ""
     elif status == "unavailable":
-        prefix = "本次不可用（不等于已删除）：" + date_text(row.get("checked_at"))
+        prefix = "暂时无法查看项目（未确认是否删除）；查询于 " + date_text(row.get("checked_at"))
     else:
-        prefix = "本次获取失败：" + date_text(row.get("checked_at"))
+        prefix = "本次未能取得项目信息；查询于 " + date_text(row.get("checked_at"))
     if isinstance(data, dict):
         flags = []
         if type(data.get("archived")) is bool:
@@ -240,59 +245,57 @@ def repo_observation(row, detailed=False):
             flags.append("已禁用")
         snapshot = "；".join(flags)
         if status != "ok":
-            snapshot = "沿用旧记录：" + snapshot + "（最后成功 " + date_text(row.get("repository_last_success_at")) + "）"
-        prefix += "；" + snapshot
+            snapshot = "以下为旧信息：" + snapshot + "；上次查到 " + date_text(row.get("repository_last_success_at"))
+        prefix += ("；" if prefix else "") + snapshot
         if detailed:
             actual = github_root(data.get("html_url"))
-            label = "返回仓库" if status == "ok" else "旧记录仓库"
+            label = "项目来源" if status == "ok" else "旧信息来源"
             if actual:
                 prefix += "；" + label + "：[" + cell(actual) + "](<https://github.com/" + actual + ">)"
             else:
-                prefix += "；" + label + "链接无效或缺失"
-            prefix += "；" + ("最近推送 " if status == "ok" else "旧记录推送 ") + date_text(data.get("pushed_at"))
+                prefix += "；" + label + "链接暂不可用"
+            prefix += "；" + ("最近提交代码 " if status == "ok" else "旧信息中的代码提交时间 ") + date_text(data.get("pushed_at"))
     elif status == "ok":
-        prefix += "；元数据未记录"
-    if status != "ok" and row.get("error_code"):
-        prefix += "；错误 " + cell(row["error_code"])
+        prefix += ("；" if prefix else "") + "暂无项目详情"
     return prefix
 
 
 def release_observation(row):
     if row is None:
-        return "尚未检查"
+        return "暂无版本记录"
     status = row["release_status"]
     if status == "none":
-        return "检查成功，未发现 Release（" + date_text(row.get("release_last_success_at") or row.get("checked_at")) + "）"
+        return "GitHub 未查到正式发布版；查询于 " + date_text(row.get("release_last_success_at") or row.get("checked_at"))
     data = row.get("release")
     if status == "error":
-        prefix = "本次 Release 获取失败"
+        prefix = "本次版本查询失败"
     elif status == "not_checked":
-        prefix = "本次未检查 Release"
+        prefix = "本次未查询版本"
     else:
-        prefix = "最近一次成功观察"
+        prefix = ""
     if isinstance(data, dict):
         tag = cell(data.get("tag_name"))
         link = release_url(data.get("html_url"))
-        item = "[" + tag + "](<" + link + ">)" if link else tag + "（链接无效或缺失）"
+        item = "[" + tag + "](<" + link + ">)" if link else tag + "（版本链接暂不可用）"
         if status != "ok":
-            prefix += "；沿用旧记录"
-        prefix += "：" + item + "；发布 " + date_text(data.get("published_at"))
-        prefix += "；最后成功 " + date_text(row.get("release_last_success_at"))
+            prefix += "；以下为旧版本信息："
+        prefix += item + "；发布于 " + date_text(data.get("published_at"))
+        prefix += "；查询于 " + date_text(row.get("release_last_success_at"))
     elif status == "ok":
-        prefix += "；发布记录缺失，不能判断版本"
+        prefix = "暂无完整版本信息"
     else:
-        prefix += "；无可展示的历史成功记录"
+        prefix += "；暂无旧版本记录"
     if status != "ok":
-        prefix += "；本次检查 " + date_text(row.get("checked_at"))
+        prefix += "；本次查询于 " + date_text(row.get("checked_at"))
     return prefix
 
 
 def run_summary(state):
     run = state.get("last_run")
     if run is None:
-        return "尚未运行 GitHub 元数据检查。"
-    return ("最近一轮：" + date_text(run.get("checked_at")) + "；仓库数 " + str(run["repository_count"])
-            + "，成功 " + str(run["ok_count"]) + "，错误 " + str(run["error_count"]) + "。单项结果和最后成功时间见下表。")
+        return "暂未取得版本信息。你可以先打开资料页，查看项目介绍和下载来源。"
+    return ("最近查询：" + date_text(run.get("checked_at")) + "。本次已更新 " + str(run["ok_count"])
+            + " 个项目的信息，另有 " + str(run["error_count"]) + " 个暂未更新；各项目的版本和日期见下表。")
 
 
 def render(library, manifest, state):
@@ -302,47 +305,40 @@ def render(library, manifest, state):
     mapping = {entity_id: row["full_name"] for row in manifest["repositories"] for entity_id in row["entity_ids"]}
     excluded = {row["entity_id"]: row["reason"] for row in manifest["excluded"]}
     observations = {key.casefold(): value for key, value in state["repositories"].items()}
-    catalog = ["# 工具与知识目录", "", "共 " + str(len(library)) + " 条资料。按类型浏览，点击名称阅读完整卡片。", "",
-               "“已阅读第一方来源”仅表示内容来源审核，不表示安装、安全、兼容性或大陆连通性测试通过。仅参考目录线索的条目，即使 GitHub 请求成功，项目身份仍未核验。", "",
-               "GitHub 列仅展示自动检查保存的元数据；未归档不等于正在维护，Release 不等于兼容版本。没有状态文件时显示尚未检查，不采用历史来源快照冒充当前数据。", "", run_summary(state), "",
-               "[查看更新检查及覆盖范围](UPDATES.md)", ""]
+    catalog = ["# 工具与知识目录", "", "共 " + str(len(library)) + " 条资料。先按类型和平台找工具，点击名称查看用途、使用提示和相关来源。", "",
+               "版本号可直接打开发布页面。“来源待核实”的资料目前只有其他目录的介绍，尚未确认对应项目；“已查阅官方资料”也不代表已经实测安装或兼容性。", "",
+               "[返回首页](README.md) · [查看版本与项目更新](UPDATES.md)", ""]
     kinds = sorted({item["kind"] for item in library}, key=lambda kind: (list(KINDS).index(kind) if kind in KINDS else len(KINDS), kind))
     for kind in kinds:
         group = sorted((item for item in library if item["kind"] == kind), key=lambda item: (item["name"].casefold(), item["id"]))
-        catalog.extend(["## " + cell(KINDS.get(kind, kind)) + "（" + str(len(group)) + "）", "",
-                        "| 项目与完整卡片 | 平台 | 内容审核 | GitHub 仓库观察 | GitHub Release 观察 |",
+        anchor = CATEGORY_ANCHORS.get(kind, re.sub(r"[^a-z0-9-]", "-", kind.lower()))
+        catalog.extend(['<a id="' + anchor + '"></a>', "", "## " + cell(KINDS.get(kind, kind)) + "（" + str(len(group)) + "）", "",
+                        "| 名称（查看详情） | 适用平台 | 最近查到的正式版 | 资料来源 | 项目状态 |",
                         "| --- | --- | --- | --- | --- |"])
         for entity in group:
             full_name = mapping.get(entity["id"])
             row = observations.get(full_name.casefold()) if full_name else None
-            repo_text = repo_observation(row) if full_name else "未纳入监测：" + EXCLUSIONS[excluded[entity["id"]]]
-            release_text = release_observation(row) if full_name else "不适用；未建立根仓库映射"
+            repo_text = repo_observation(row) if full_name else "请查看资料页中的来源"
+            release_text = release_observation(row) if full_name else EXCLUSIONS[excluded[entity["id"]]]
             platforms = "、".join(cell(p) for p in entity["platforms"]) or "未记录或不适用"
-            review = cell(REVIEW.get(entity["verification"].get("status"), "审核状态未识别，需查看卡片"))
-            catalog.append("| " + " | ".join([card_link(entity), platforms, review, repo_text, release_text]) + " |")
+            review = cell(REVIEW.get(entity["verification"].get("status"), "请查看资料页的来源说明"))
+            catalog.append("| " + " | ".join([card_link(entity), platforms, release_text, review, repo_text]) + " |")
         catalog.append("")
-    updates = ["# GitHub 元数据观察记录", "", run_summary(state), "", "## 覆盖范围", "",
-               "- 资料总数：" + str(len(library)),
-               "- 纳入监测：" + str(len(mapping)) + " 条资料，映射到 " + str(len(manifest["repositories"])) + " 个去重根仓库。",
-               "- 未纳入监测：" + str(len(excluded)) + " 条资料；原因如下。", "",
-               "| 未纳入原因 | 条目数 |", "| --- | --- |"]
-    reason_counts = Counter(excluded.values())
-    updates.extend("| " + label + " | " + str(reason_counts.get(reason, 0)) + " |" for reason, label in EXCLUSIONS.items())
-    updates.extend(["", "## 观察边界", "",
-                    "- 清单只读取原始条目的 repository 字段；仅接受 HTTPS GitHub 根仓库地址（允许末尾 / 或 .git），按仓库名忽略大小写去重。没有从官网、发现来源或历史版本链接推断归属。",
-                    "- 自动结果仅包括仓库公开可访问性、返回的仓库地址、归档/禁用状态、最近推送时间，以及 GitHub 最新正式 Release（不含草稿和预发布）；这不是发行版安装或功能测试。",
-                    "- 仓库不可用或请求失败不等于仓库已删除；没有 Release、未检查、获取失败分别展示。正式 Release 查询不包含 tags 或应用商店版本。",
-                    "- 请求失败保留旧值时，明确标注沿用旧记录及最后成功时间；日期不是维护活跃度、教程更新或兼容性证明。",
-                    "- 元数据检查不会提升原有内容审核等级，也不会确认参考目录条目的身份、路由器型号兼容性、安全性或大陆访问效果。",
-                    "- 本页和目录由固定导出快照、映射清单与状态文件生成；没有改写旧卡片、JSON、JSONL 或 SQLite 快照。", "",
-                    "## 根仓库检查结果", "", "| GitHub 根仓库 | 关联资料 | 仓库观察 | Release 观察 |", "| --- | --- | --- | --- |"])
+    updates = ["# 版本与项目更新", "", "查看工具最近发布的版本，点击版本号前往下载与更新说明。", "",
+               "[返回工具目录](CATALOG.md) · [返回首页](README.md)", "", run_summary(state), "",
+               "这里列出 " + str(len(manifest["repositories"])) + " 个 GitHub 项目的信息。其他资料的版本或来源见[本页下方](#other-sources)。", "",
+               "版本取自 GitHub 正式发布页（Release），不含草稿、预发布或仅有版本标签的记录，可能与应用商店版本不同。“暂无版本记录”不代表工具没有发布过版本。", "",
+               "“旧信息”表示本次未能取得新信息，请留意旁边的日期。“已归档”表示作者将项目设为只读；未归档或近期提交过代码，并不保证仍在维护。选择版本时仍需查看设备要求。", "",
+               "## 项目版本", "", "| 名称（查看详情） | GitHub 项目来源 | 最近查到的正式版 | 项目信息 |", "| --- | --- | --- | --- |"]
     for repo in sorted(manifest["repositories"], key=lambda item: (item["full_name"].casefold(), item["full_name"])):
         name = repo["full_name"]
         row = observations.get(name.casefold())
         links = "、".join(card_link(entities[entity_id]) for entity_id in sorted(repo["entity_ids"]))
         repo_link = "[" + cell(name) + "](<https://github.com/" + name + ">)"
-        updates.append("| " + " | ".join([repo_link, links, repo_observation(row, detailed=True), release_observation(row)]) + " |")
-    updates.extend(["", "## 未纳入监测的资料", "", "| 资料 | 原因 |", "| --- | --- |"])
+        updates.append("| " + " | ".join([links, repo_link, release_observation(row), repo_observation(row, detailed=True)]) + " |")
+    updates.extend(["", '<a id="other-sources"></a>', "", "## 其他工具与资料", "",
+                    "以下 " + str(len(excluded)) + " 条资料暂未在本页列出版本。点击名称，查看项目介绍及相关来源。", "",
+                    "| 名称（查看详情） | 去哪里查看版本或来源 |", "| --- | --- |"])
     for entity_id in sorted(excluded):
         updates.append("| " + card_link(entities[entity_id]) + " | " + EXCLUSIONS[excluded[entity_id]] + " |")
     return "\n".join(catalog).rstrip() + "\n", "\n".join(updates).rstrip() + "\n"

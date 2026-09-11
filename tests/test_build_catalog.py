@@ -109,16 +109,16 @@ class ObservationTests(unittest.TestCase):
         row["error_code"] = "network_error"
         first, second = render_one(row)
         for text in (first, second):
-            self.assertIn("本次获取失败", text)
-            self.assertIn("本次 Release 获取失败；沿用旧记录", text)
-            self.assertIn("沿用旧记录：已归档", text)
-            self.assertIn("最后成功 2026-09-01T00:00:00Z", text)
-            self.assertIn("2026-09-12T01:00:00Z", text)
-            self.assertNotIn("检查成功，未发现 Release", text)
+            self.assertIn("本次未能取得项目信息", text)
+            self.assertIn("本次版本查询失败；以下为旧版本信息", text)
+            self.assertIn("以下为旧信息：已归档", text)
+            self.assertIn("上次查到 2026-09-01 08:00（北京时间）", text)
+            self.assertIn("2026-09-12 09:00（北京时间）", text)
+            self.assertNotIn("GitHub 未查到正式发布版", text)
 
     def test_none_is_not_fetch_failure_and_does_not_display_retained_release(self):
         text = catalog.release_observation(observation(release_status="none"))
-        self.assertIn("检查成功，未发现 Release", text)
+        self.assertIn("GitHub 未查到正式发布版", text)
         self.assertNotIn("v1.0", text)
         self.assertNotIn("失败", text)
 
@@ -127,14 +127,14 @@ class ObservationTests(unittest.TestCase):
         row["repository"] = row["release"] = None
         row["repository_last_success_at"] = row["release_last_success_at"] = None
         text = "\n".join(render_one(row))
-        self.assertIn("本次不可用（不等于已删除）", text)
-        self.assertIn("本次未检查 Release；无可展示的历史成功记录", text)
+        self.assertIn("暂时无法查看项目（未确认是否删除）", text)
+        self.assertIn("本次未查询版本；暂无旧版本记录", text)
         row["release_status"] = "error"
-        self.assertIn("本次 Release 获取失败；无可展示的历史成功记录", catalog.release_observation(row))
+        self.assertIn("本次版本查询失败；暂无旧版本记录", catalog.release_observation(row))
 
     def test_success_never_promotes_review_or_imports_source_version(self):
         text = "\n".join(render_one())
-        self.assertIn("仅参考目录线索；项目身份未核验", text)
+        self.assertIn("仅有目录介绍，来源待核实", text)
         self.assertNotIn("UNVERIFIED-SOURCE-VERSION", text)
         self.assertIn("未归档", text)
         self.assertIn("v1.0%2Btest", text)
@@ -143,12 +143,12 @@ class ObservationTests(unittest.TestCase):
         row = observation()
         row["repository"]["html_url"] = "https://github.com/NewOwner/new-project"
         updates = render_one(row)[1]
-        self.assertIn("返回仓库：[NewOwner/new-project](<https://github.com/NewOwner/new-project>)", updates)
-        self.assertIn("最近推送 2026-09-01T00:00:00Z", updates)
+        self.assertIn("项目来源：[NewOwner/new-project](<https://github.com/NewOwner/new-project>)", updates)
+        self.assertIn("最近提交代码 2026-09-01 08:00（北京时间）", updates)
         row["repository_status"] = "error"
         updates = render_one(row)[1]
-        self.assertIn("旧记录仓库", updates)
-        self.assertIn("旧记录推送", updates)
+        self.assertIn("旧信息来源", updates)
+        self.assertIn("旧信息中的代码提交时间", updates)
         row["repository"]["html_url"] = "https://evil.test/payload"
         self.assertNotIn("https://evil.test", render_one(row)[1])
 
@@ -177,7 +177,7 @@ class ObservationTests(unittest.TestCase):
             self.assertNotIn("[img](evil)", text)
             self.assertIn("&#124;", text)
             self.assertIn("&lt;script&gt;", text)
-            self.assertIn("链接无效或缺失", text)
+            self.assertIn("版本链接暂不可用", text)
         rows = [line for line in first.splitlines() if line.startswith("| ")]
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(line.count("|") == 6 for line in rows))
@@ -231,7 +231,15 @@ class FullCatalogTests(unittest.TestCase):
         self.assertEqual(reasons["mwan3"], "invalid_repository_mapping")
         self.assertEqual(reasons["ouinet"], "non_github_repository")
         self.assertEqual(reasons["clash-net"], "missing_repository")
-        self.assertIn("尚未运行", second)
+        self.assertIn("暂未取得版本信息", second)
+
+    def test_reader_navigation_has_stable_category_anchors(self):
+        first, second = catalog.render(self.library, self.manifest, self.empty_state)
+        for anchor in ("clients", "cores", "protocols", "concepts", "router-firmware", "router-plugins", "dns", "rules"):
+            self.assertEqual(first.count('<a id="' + anchor + '"></a>'), 1)
+        for text in (first, second):
+            for internal_term in ("元数据", "根仓库", "映射", "状态文件", "repository", "JSON", "SQLite", "Actions"):
+                self.assertNotIn(internal_term, text)
 
     def test_determinism_including_input_order(self):
         original = catalog.render(self.library, self.manifest, self.empty_state)
@@ -254,7 +262,7 @@ class FullCatalogTests(unittest.TestCase):
             self.assertEqual(first.stdout, second.stdout)
             self.assertEqual(saved, [(base / name).read_bytes() for name in ("catalog.md", "updates.md")])
             self.assertNotIn(b"\r\n", saved[0])
-            self.assertIn("尚未检查", saved[0].decode("utf-8"))
+            self.assertIn("暂无版本记录", saved[0].decode("utf-8"))
 
 
 if __name__ == "__main__":

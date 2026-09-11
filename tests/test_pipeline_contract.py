@@ -34,16 +34,16 @@ class PipelineContractTests(unittest.TestCase):
         state = update_upstream.build_state([slug], {'repositories':{}}, now, Client())
         update_upstream.validate_state(state)
         catalog, updates = build_catalog.render([entity], build_catalog.make_manifest([entity]), state)
-        self.assertIn('未发现 Release', catalog)
-        self.assertIn('项目身份未核验', catalog)
+        self.assertIn('未查到正式发布版', catalog)
+        self.assertIn('来源待核实', catalog)
         class FailedClient:
             def fetch(self, name, release=False):
                 raise update_upstream.FetchError('network_error')
         stale = update_upstream.build_state([slug], state, '2026-09-13T00:00:00Z', FailedClient())
         update_upstream.validate_state(stale)
         catalog, updates = build_catalog.render([entity], build_catalog.make_manifest([entity]), stale)
-        self.assertIn('沿用旧记录', catalog)
-        self.assertIn('2026-09-12T00:00:00Z', catalog)
+        self.assertIn('旧信息', catalog)
+        self.assertIn('2026-09-12 08:00（北京时间）', catalog)
 
 
 if __name__ == '__main__':

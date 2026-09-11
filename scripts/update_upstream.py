@@ -1,7 +1,8 @@
 """Refresh public GitHub metadata without changing the authored knowledge snapshot.
 
 Only GITHUB_TOKEN (optional) and GITHUB_STEP_SUMMARY are read from the environment.
-No redirects are followed, and failed checks retain the last successful payload.
+Only bounded, explicitly validated GitHub API redirects are followed. Failed
+checks retain the last successful payload and its repository identity.
 """
 
 import argparse
@@ -32,6 +33,7 @@ MAX_WORKERS = 4
 RUN_BUDGET_SECONDS = 18 * 60
 REQUEST_TIMEOUT = 10
 MAX_ATTEMPTS = 3
+MAX_REDIRECTS = 3
 MAX_RETRY_DELAY = 10
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -51,6 +53,14 @@ class FetchError(Exception):
         super().__init__(code)
         self.code = code
         self.systemic = systemic
+
+
+class APIResponse(dict):
+    """Response plus transport provenance that cannot be supplied by JSON fields."""
+
+    def __init__(self, payload, api_redirect_chain):
+        super().__init__(payload)
+        self.api_redirect_chain = tuple(api_redirect_chain)
 
 
 def valid_slug(value):
@@ -116,20 +126,66 @@ def github_url(value, slug, release=False):
     return value
 
 
-def repository_payload(value, slug):
+def api_repository_url(value, release=False):
+    """Accept only the two public repository endpoint forms on the exact API origin."""
+    valid_text(value, 4096)
+    try:
+        parts = urllib.parse.urlsplit(value)
+        safe_origin = (parts.scheme == "https" and parts.netloc == "api.github.com"
+                       and parts.username is None and parts.password is None
+                       and parts.port is None and not parts.query and not parts.fragment)
+    except ValueError:
+        raise ValidationError("invalid_api_redirect_url") from None
+    # No escaping, path normalization, user endpoints, or arbitrary API methods.
+    if not safe_origin or "%" in parts.path or "\\" in parts.path:
+        raise ValidationError("invalid_api_redirect_url")
+    path = parts.path
+    if release:
+        if not path.endswith("/releases/latest"):
+            raise ValidationError("invalid_api_redirect_path")
+        path = path[:-len("/releases/latest")]
+    if path.startswith("/repos/"):
+        valid_slug(path[len("/repos/"):])
+    elif not re.fullmatch(r"/repositories/[1-9][0-9]{0,19}", path):
+        raise ValidationError("invalid_api_redirect_path")
+    return value
+
+
+def validate_resolution(value, slug, success_at):
+    """Validate saved migration provenance; it never changes the authored manifest."""
+    if not isinstance(value, dict):
+        raise ValidationError("invalid_repository_resolution")
+    name = valid_slug(value.get("full_name"))
+    valid_time(value.get("checked_at"))
+    if value["checked_at"] != success_at:
+        raise ValidationError("invalid_resolution_timestamp")
+    chain = value.get("api_redirect_chain")
+    if not isinstance(chain, list) or not 2 <= len(chain) <= MAX_REDIRECTS + 1:
+        raise ValidationError("invalid_resolution_chain")
+    for url in chain:
+        api_repository_url(url)
+    if len(set(chain)) != len(chain) or chain[0] != "https://api.github.com/repos/" + slug:
+        raise ValidationError("invalid_resolution_chain")
+    final_path = urllib.parse.urlsplit(chain[-1]).path
+    if final_path.startswith("/repos/") and final_path[len("/repos/"):].lower() != name.lower():
+        raise ValidationError("resolution_identity_mismatch")
+    return name
+
+
+def repository_payload(value, slug, allow_redirect=False):
     if not isinstance(value, dict):
         raise ValidationError("invalid_repository_response")
     required = {"full_name", "html_url", "archived", "disabled", "pushed_at", "default_branch"}
     if not required.issubset(value):
         raise ValidationError("invalid_repository_response")
     name = valid_slug(value["full_name"])
-    if name.lower() != slug.lower():
+    if name.lower() != slug.lower() and not allow_redirect:
         raise ValidationError("repository_identity_mismatch")
     if type(value["archived"]) is not bool or type(value["disabled"]) is not bool:
         raise ValidationError("invalid_repository_flags")
     return {
         "full_name": name,
-        "html_url": github_url(value["html_url"], slug),
+        "html_url": github_url(value["html_url"], name),
         "archived": value["archived"],
         "disabled": value["disabled"],
         "pushed_at": valid_time(value["pushed_at"], nullable=True),
@@ -229,16 +285,27 @@ def validate_state(value):
                 raise ValidationError("incomplete_previous_state")
         valid_time(entry["repository_last_success_at"], nullable=True)
         valid_time(entry["release_last_success_at"], nullable=True)
+        repository_name, release_name = slug, slug
+        if "repository_resolution" in entry:
+            if entry["repository"] is None:
+                raise ValidationError("resolution_without_repository")
+            repository_name = validate_resolution(entry["repository_resolution"], slug, entry["repository_last_success_at"])
+        if "release_resolution" in entry:
+            if entry["release"] is None:
+                raise ValidationError("resolution_without_release")
+            release_name = validate_resolution(entry["release_resolution"], slug, entry["release_last_success_at"])
         if entry["repository"] is not None:
-            repository_payload(entry["repository"], slug)
+            repository_payload(entry["repository"], repository_name)
             if entry["repository_last_success_at"] is None:
                 raise ValidationError("missing_previous_success_time")
         elif entry["repository_status"] == "ok":
             raise ValidationError("missing_previous_repository")
         if entry["release"] is not None:
-            release_payload(entry["release"], slug)
+            release_payload(entry["release"], release_name)
             if entry["release_last_success_at"] is None or entry["release_status"] == "none":
                 raise ValidationError("invalid_previous_release")
+            if entry["release_status"] == "ok" and release_name.lower() != repository_name.lower():
+                raise ValidationError("release_repository_identity_mismatch")
         elif entry["release_status"] == "ok":
             raise ValidationError("missing_previous_release")
         code = entry["error_code"]
@@ -249,8 +316,9 @@ def validate_state(value):
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Block same-origin redirects too: a moved repository needs explicit review.
-        raise FetchError("redirect_blocked")
+        # urllib must never create a follow-up request. APIClient examines the
+        # resulting HTTPError and makes any allowed next request explicitly.
+        return None
 
 
 class APIClient:
@@ -334,7 +402,9 @@ class APIClient:
                    "X-GitHub-Api-Version": "2022-11-28"}
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
-        for attempt in range(MAX_ATTEMPTS):
+        chain = [url]
+        attempt = 0
+        while attempt < MAX_ATTEMPTS:
             if self.halted.is_set():
                 raise FetchError("run_halted")
             remaining = self.deadline - self.monotonic()
@@ -351,12 +421,29 @@ class APIClient:
                         raise FetchError("unexpected_http_status")
                     body = self._read_response(response, request_deadline)
                 try:
-                    return json.loads(body.decode("utf-8"))
+                    payload = json.loads(body.decode("utf-8"))
                 except (ValueError, UnicodeError):
                     raise FetchError("invalid_json") from None
+                if not isinstance(payload, dict):
+                    raise FetchError("invalid_json_shape")
+                return APIResponse(payload, chain)
             except urllib.error.HTTPError as error:
                 status = error.code
                 retry_headers = error.headers or {}
+                if status in {301, 302, 303, 307, 308}:
+                    location = retry_headers.get("Location")
+                    error.close()
+                    try:
+                        target = api_repository_url(location, release=release)
+                    except ValidationError:
+                        raise FetchError("redirect_blocked") from None
+                    if target in chain:
+                        raise FetchError("redirect_loop")
+                    if len(chain) - 1 >= MAX_REDIRECTS:
+                        raise FetchError("redirect_limit")
+                    chain.append(target)
+                    url = target
+                    continue
                 try:
                     message = error.read(8192).decode("utf-8", errors="replace").lower()
                 except (OSError, http.client.HTTPException):
@@ -385,6 +472,7 @@ class APIClient:
                     raise self._fail_systemic(code)
                 raise FetchError(code)
             self._delay(retry_headers, attempt, rate_limited)
+            attempt += 1
         raise FetchError("network_error")
 
 
@@ -400,24 +488,41 @@ def update_repository(slug, previous, now, client):
         "release_last_success_at": old.get("release_last_success_at"),
         "error_code": None,
     }
+    for key in ("repository_resolution", "release_resolution"):
+        if key in old:
+            entry[key] = deepcopy(old[key])
     try:
-        payload = repository_payload(client.fetch(slug), slug)
+        response = client.fetch(slug)
+        chain = list(response.api_redirect_chain) if isinstance(response, APIResponse) else []
+        payload = repository_payload(response, slug, allow_redirect=len(chain) > 1)
+        resolution = None
+        if len(chain) > 1:
+            resolution = {"full_name": payload["full_name"], "checked_at": now, "api_redirect_chain": chain}
+            validate_resolution(resolution, slug, now)
     except (FetchError, ValidationError) as error:
         code = error.code if isinstance(error, FetchError) else "invalid_repository_response"
         entry["repository_status"] = "unavailable" if code == "not_found" else "error"
         entry["error_code"] = "repository_not_found" if code == "not_found" else code
         return entry
     entry.update(repository_status="ok", repository=payload, repository_last_success_at=now)
+    entry.pop("repository_resolution", None)
+    if resolution is not None:
+        entry["repository_resolution"] = resolution
+    canonical_name = payload["full_name"]
     try:
-        payload = release_payload(client.fetch(slug, release=True), slug)
+        payload = release_payload(client.fetch(canonical_name, release=True), canonical_name)
     except (FetchError, ValidationError) as error:
         code = error.code if isinstance(error, FetchError) else "invalid_release_response"
         if code == "not_found":
             entry.update(release_status="none", release=None, release_last_success_at=now)
+            entry.pop("release_resolution", None)
         else:
             entry.update(release_status="error", error_code=code)
         return entry
     entry.update(release_status="ok", release=payload, release_last_success_at=now)
+    entry.pop("release_resolution", None)
+    if resolution is not None:
+        entry["release_resolution"] = deepcopy(resolution)
     return entry
 
 

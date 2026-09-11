@@ -22,6 +22,19 @@ REPO = {"full_name": SLUG, "html_url": "https://github.com/" + SLUG,
         "archived": False, "disabled": False, "pushed_at": OLD, "default_branch": "main"}
 RELEASE = {"tag_name": "v1.0", "html_url": "https://github.com/" + SLUG + "/releases/tag/v1.0", "published_at": OLD}
 MANIFEST = {"schema_version": 1, "repositories": [{"full_name": SLUG, "entity_ids": ["tool"]}], "excluded": []}
+API_URL = "https://api.github.com/repos/" + SLUG
+CANONICAL = "moved/tool-new"
+CANONICAL_API = "https://api.github.com/repos/" + CANONICAL
+MOVED_REPO = dict(REPO, full_name=CANONICAL, html_url="https://github.com/" + CANONICAL)
+MOVED_RELEASE = dict(RELEASE, html_url="https://github.com/" + CANONICAL + "/releases/tag/v1.0")
+
+
+def redirect(target, source=API_URL, status=301):
+    return urllib.error.HTTPError(source, status, "Moved", {"Location": target}, io.BytesIO(b"{}"))
+
+
+def moved_response():
+    return updater.APIResponse(MOVED_REPO, [API_URL, CANONICAL_API])
 
 
 class StubClient:
@@ -155,13 +168,141 @@ class UpstreamTests(unittest.TestCase):
         with self.assertRaises(updater.ValidationError):
             updater.release_payload(dict(RELEASE, tag_name="v2.0"), SLUG)
 
-    def test_redirect_handler_blocks_token_forwarding(self):
+    def test_redirect_handler_never_implicitly_forwards_token(self):
         request = urllib.request.Request("https://api.github.com/repos/" + SLUG,
                                          headers={"Authorization": "Bearer test-token"})
         for target in ("https://attacker.test/collect", "https://api.github.com/repos/moved/tool"):
-            with self.subTest(target=target), self.assertRaises(updater.FetchError) as raised:
-                updater.NoRedirects().redirect_request(request, None, 302, "Found", {}, target)
-            self.assertEqual(raised.exception.code, "redirect_blocked")
+            with self.subTest(target=target):
+                self.assertIsNone(updater.NoRedirects().redirect_request(request, None, 302, "Found", {}, target))
+
+    def test_verified_rename_chain_keeps_manifest_key_and_uses_canonical_release(self):
+        numeric = "https://api.github.com/repositories/12345"
+        opener = Opener(redirect(numeric), redirect(CANONICAL_API, numeric),
+                        Response(MOVED_REPO, CANONICAL_API),
+                        Response(MOVED_RELEASE, CANONICAL_API + "/releases/latest"))
+        client = updater.APIClient(token="fake-test-token", opener=opener)
+        state = updater.build_state([SLUG], {"repositories": {}}, NOW, client)
+        self.assertEqual(list(state["repositories"]), [SLUG])
+        entry = state["repositories"][SLUG]
+        self.assertEqual(entry["repository"], MOVED_REPO)
+        self.assertEqual(entry["release"], MOVED_RELEASE)
+        self.assertTrue(updater.is_complete(entry))
+        self.assertEqual(entry["repository_resolution"]["api_redirect_chain"], [API_URL, numeric, CANONICAL_API])
+        self.assertEqual(entry["release_resolution"]["full_name"], CANONICAL)
+        self.assertEqual([request.full_url for request, _ in opener.requests],
+                         [API_URL, numeric, CANONICAL_API, CANONICAL_API + "/releases/latest"])
+        self.assertTrue(all(request.get_header("Authorization") == "Bearer fake-test-token" for request, _ in opener.requests))
+        self.assertEqual(updater.validate_state(state), state)
+
+    def test_canonical_release_may_redirect_to_numeric_release_endpoint(self):
+        numeric = "https://api.github.com/repositories/12345/releases/latest"
+        opener = Opener(redirect(CANONICAL_API), Response(MOVED_REPO, CANONICAL_API),
+                        redirect(numeric, CANONICAL_API + "/releases/latest", 307),
+                        Response(MOVED_RELEASE, numeric))
+        entry = updater.update_repository(SLUG, None, NOW, updater.APIClient(opener=opener))
+        self.assertEqual(entry["release_status"], "ok")
+        self.assertEqual(entry["release"], MOVED_RELEASE)
+        updater.validate_state(state_for(entry))
+
+    def test_cross_origin_redirect_never_receives_token(self):
+        targets = ("https://attacker.test/repos/moved/tool", "http://api.github.com/repos/moved/tool",
+                   "https://api.github.com.attacker.test/repos/moved/tool", "https://api.github.com@attacker.test/repos/moved/tool",
+                   "https://attacker@api.github.com/repos/moved/tool", "https://api.github.com:443/repos/moved/tool")
+        for target in targets:
+            with self.subTest(target=target):
+                opener = Opener(redirect(target))
+                client = updater.APIClient(token="fake-test-token", opener=opener)
+                with self.assertRaises(updater.FetchError) as raised:
+                    client.fetch(SLUG)
+                self.assertEqual(raised.exception.code, "redirect_blocked")
+                self.assertEqual([req.full_url for req, _ in opener.requests], [API_URL])
+
+    def test_redirect_rejects_nonrepository_paths_queries_and_escaping(self):
+        targets = ("https://api.github.com/user", "https://api.github.com/repos/moved/tool/contents",
+                   "https://api.github.com/repos/moved/tool?token=not-real", "https://api.github.com/repos/moved/tool#fragment",
+                   "https://api.github.com/repos/moved/%2e%2e", "https://api.github.com/repositories/not-a-number",
+                   "https://api.github.com/repositories/0", "/repositories/12345",
+                   "https://api.github.com/repos/moved/tool/releases/latest")
+        for target in targets:
+            with self.subTest(target=target):
+                opener = Opener(redirect(target))
+                with self.assertRaises(updater.FetchError) as raised:
+                    updater.APIClient(opener=opener).fetch(SLUG)
+                self.assertEqual(raised.exception.code, "redirect_blocked")
+                self.assertEqual(len(opener.requests), 1)
+
+    def test_redirect_loop_stops_before_repeating_request(self):
+        opener = Opener(redirect(CANONICAL_API), redirect(API_URL, CANONICAL_API))
+        with self.assertRaises(updater.FetchError) as raised:
+            updater.APIClient(opener=opener).fetch(SLUG)
+        self.assertEqual(raised.exception.code, "redirect_loop")
+        self.assertEqual(len(opener.requests), 2)
+
+    def test_at_most_three_redirects_are_followed(self):
+        urls = [API_URL] + ["https://api.github.com/repositories/" + str(i) for i in range(1, 5)]
+        opener = Opener(*(redirect(target, source) for source, target in zip(urls, urls[1:])))
+        with self.assertRaises(updater.FetchError) as raised:
+            updater.APIClient(opener=opener).fetch(SLUG)
+        self.assertEqual(raised.exception.code, "redirect_limit")
+        self.assertEqual([req.full_url for req, _ in opener.requests], urls[:4])
+
+    def test_json_cannot_claim_transport_provenance_for_identity_change(self):
+        forged = dict(MOVED_REPO, api_redirect_chain=[API_URL, CANONICAL_API])
+        opener = Opener(Response(forged))
+        entry = updater.update_repository(SLUG, old_entry(), NOW, updater.APIClient(opener=opener))
+        self.assertEqual(entry["repository_status"], "error")
+        self.assertEqual(entry["repository"], REPO)
+        self.assertNotIn("repository_resolution", entry)
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_redirected_named_endpoint_must_match_response_identity(self):
+        wrong = dict(MOVED_REPO, full_name="unrelated/project", html_url="https://github.com/unrelated/project")
+        opener = Opener(redirect(CANONICAL_API), Response(wrong, CANONICAL_API))
+        entry = updater.update_repository(SLUG, old_entry(), NOW, updater.APIClient(opener=opener))
+        self.assertEqual(entry["repository_status"], "error")
+        self.assertEqual(entry["repository"], REPO)
+        self.assertNotIn("repository_resolution", entry)
+
+    def test_malformed_redirected_response_preserves_last_good_data(self):
+        wrong = dict(MOVED_REPO, html_url="https://attacker.test/moved/tool-new")
+        opener = Opener(redirect(CANONICAL_API), Response(wrong, CANONICAL_API))
+        entry = updater.update_repository(SLUG, old_entry(), NOW, updater.APIClient(opener=opener))
+        self.assertEqual(entry["repository_status"], "error")
+        self.assertEqual(entry["repository"], REPO)
+        self.assertEqual(entry["release"], RELEASE)
+
+    def test_rename_with_release_failure_preserves_old_release_identity(self):
+        entry = updater.update_repository(SLUG, old_entry(), NOW,
+                                          StubClient(moved_response(), updater.FetchError("network_error")))
+        self.assertEqual(entry["repository"], MOVED_REPO)
+        self.assertEqual(entry["release"], RELEASE)
+        self.assertEqual(entry["release_status"], "error")
+        self.assertNotIn("release_resolution", entry)
+        updater.validate_state(state_for(entry))
+
+    def test_renamed_old_state_survives_a_later_network_failure(self):
+        previous = updater.update_repository(SLUG, None, OLD, StubClient(moved_response(), MOVED_RELEASE))
+        previous_bytes = json.dumps(state_for(previous), sort_keys=True)
+        updater.validate_state(json.loads(previous_bytes))
+        entry = updater.update_repository(SLUG, previous, NOW, StubClient(updater.FetchError("network_error")))
+        self.assertEqual(entry["repository_resolution"], previous["repository_resolution"])
+        self.assertEqual(entry["release_resolution"], previous["release_resolution"])
+        self.assertEqual(entry["repository_last_success_at"], OLD)
+        self.assertEqual(entry["release_last_success_at"], OLD)
+        updater.validate_state(state_for(entry))
+        self.assertEqual(json.dumps(state_for(previous), sort_keys=True), previous_bytes)
+
+    def test_renamed_state_requires_valid_provenance(self):
+        entry = updater.update_repository(SLUG, None, NOW, StubClient(moved_response(), MOVED_RELEASE))
+        for key in ("repository_resolution", "release_resolution"):
+            invalid = deepcopy(entry)
+            del invalid[key]
+            with self.subTest(key=key), self.assertRaises(updater.ValidationError):
+                updater.validate_state(state_for(invalid))
+        invalid = deepcopy(entry)
+        invalid["repository_resolution"]["api_redirect_chain"][-1] = "https://attacker.test/repos/moved/tool-new"
+        with self.assertRaises(updater.ValidationError):
+            updater.validate_state(state_for(invalid))
 
     def test_invalid_slug_rejected_before_authenticated_request(self):
         opener = Opener()
