@@ -131,6 +131,22 @@ class ParsingTests(unittest.TestCase):
         result = collector.parse_content("\n".join(values).encode(), feed())
         self.assertEqual(result["unique_count"], 3)
 
+    def test_vmess_labels_and_share_versions_do_not_duplicate_connections(self):
+        without_metadata = {"add": "8.8.8.8", "port": "443", "id": UID, "aid": "0", "net": "ws"}
+        values = [vmess(ps="first"), vmess(ps="second", v="1"),
+                  "vmess://" + b64(json.dumps(without_metadata))]
+        result = collector.parse_content("\n".join(values).encode(), feed())
+        self.assertEqual((result["valid_count"], result["unique_count"], result["duplicate_count"]), (3, 1, 2))
+
+    def test_vmess_connection_options_remain_distinct(self):
+        changes = {"add": "1.1.1.1", "port": "8443", "id": "550e8400-e29b-41d4-a716-446655440001",
+                   "net": "tcp", "tls": "tls", "host": "example.com", "path": "/ws", "sni": "example.com",
+                   "aid": "1", "scy": "auto", "alpn": "h2", "fp": "chrome", "future_option": "preserve"}
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                result = collector.parse_content((vmess() + "\n" + vmess(**{field: value})).encode(), feed())
+                self.assertEqual((result["unique_count"], result["duplicate_count"]), (2, 0))
+
     def test_plain_proxy_uses_only_declared_protocol_and_normalizes_ipv6(self):
         content = b"8.8.8.8:8080\r\n[2606:4700:4700::1111]:1080\n[2606:4700:4700:0:0:0:0:1111]:1080\nexample.com:3128\nuser:pass@8.8.8.8:80\nhttps://example.com/\n"
         result = collector.parse_content(content, feed("plain_proxy", protocol="socks5"))

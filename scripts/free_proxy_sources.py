@@ -330,6 +330,10 @@ def parse_uri(line):
         data["add"] = public_host(data.get("add"))
         data["port"] = port_number(data.get("port"))
         data["id"] = uuid_text(data.get("id"))
+        # Display label and share-format version do not change the connection.
+        # Preserve every other field, including transport/TLS and future options.
+        data.pop("ps", None)
+        data.pop("v", None)
         return identity(protocol, data)
     if protocol == "ssr":
         decoded = decode_base64(body)
