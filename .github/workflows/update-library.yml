@@ -14,6 +14,7 @@ on:
       - 'scripts/build_catalog.py'
       - 'scripts/free_proxy_sources.py'
       - 'scripts/build_free_proxy_pages.py'
+      - 'scripts/run_update_pipeline.py'
       - 'tests/**'
   pull_request:
     paths:
@@ -23,6 +24,7 @@ on:
       - 'scripts/build_catalog.py'
       - 'scripts/free_proxy_sources.py'
       - 'scripts/build_free_proxy_pages.py'
+      - 'scripts/run_update_pipeline.py'
       - 'tests/**'
 
 permissions:
@@ -56,7 +58,7 @@ jobs:
     needs: verify
     if: github.repository == 'mtmpss/Fanqiang-Guide' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 90
     permissions:
       contents: write
     steps:
@@ -64,31 +66,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
       - name: 准备 Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.13'
-      - name: 检查公开 GitHub 项目
+      - name: 分别更新两类资料并发布成功结果
+        if: ${{ success() && !cancelled() }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python scripts/update_upstream.py
-      - name: 生成可阅读目录和检查报告
-        run: python scripts/build_catalog.py
-      - name: 收集公开节点订阅与代理来源
-        run: python scripts/free_proxy_sources.py
-      - name: 生成每日资料页与日期目录
-        run: python scripts/build_free_proxy_pages.py
-      - name: 发布本次检查结果
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add -- data/upstream.json CATALOG.md UPDATES.md data/free-proxy-sources.json free-proxies/
-          if git diff --cached --quiet; then
-            echo '内容未变化，无需提交。'
-            exit 0
-          fi
-          git -c user.name='github-actions[bot]' \
-              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              -c commit.gpgSign=false \
-              commit -m '更新工具版本与每日免费代理资料'
-          git push origin HEAD:main
+        run: python scripts/run_update_pipeline.py
