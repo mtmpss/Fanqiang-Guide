@@ -15,6 +15,7 @@ on:
       - 'scripts/free_proxy_sources.py'
       - 'scripts/build_free_proxy_pages.py'
       - 'scripts/run_update_pipeline.py'
+      - 'tools/**'
       - 'tests/**'
   pull_request:
     paths:
@@ -25,6 +26,7 @@ on:
       - 'scripts/free_proxy_sources.py'
       - 'scripts/build_free_proxy_pages.py'
       - 'scripts/run_update_pipeline.py'
+      - 'tools/**'
       - 'tests/**'
 
 permissions:
