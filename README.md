@@ -87,4 +87,10 @@
 - **基础概念**：[TUN](export/cards/concept-tun-v0.1-2026-09-11.md) · [FakeIP](export/cards/concept-fakeip-v0.1-2026-09-11.md) · [规则集](export/cards/concept-ruleset-v0.1-2026-09-11.md)
 - **继续查找**：[代理协议](CATALOG.md#protocols) · [DNS 工具](CATALOG.md#dns) · [分流规则](CATALOG.md#rules)
 
+<a id="official-docs"></a>
+## 官方教程与技术文档
+
+- **[Xray 官方中文文档](https://xtls.github.io/)**：快速入门、配置指南、入门与进阶技巧，以及 VLESS、REALITY 等技术资料。
+- **[sing-box 官方文档](https://sing-box.sagernet.org/)**：客户端、服务端、DNS、路由和配置迁移说明，适合查配置与排错；站内可切换简体中文。
+
 [查看全部 310 个工具与知识条目 →](CATALOG.md)
