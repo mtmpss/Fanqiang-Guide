@@ -12,6 +12,8 @@ on:
       - 'config/**'
       - 'scripts/update_upstream.py'
       - 'scripts/build_catalog.py'
+      - 'scripts/free_proxy_sources.py'
+      - 'scripts/build_free_proxy_pages.py'
       - 'tests/**'
   pull_request:
     paths:
@@ -19,6 +21,8 @@ on:
       - 'config/**'
       - 'scripts/update_upstream.py'
       - 'scripts/build_catalog.py'
+      - 'scripts/free_proxy_sources.py'
+      - 'scripts/build_free_proxy_pages.py'
       - 'tests/**'
 
 permissions:
@@ -70,11 +74,15 @@ jobs:
         run: python scripts/update_upstream.py
       - name: 生成可阅读目录和检查报告
         run: python scripts/build_catalog.py
+      - name: 收集公开节点订阅与代理来源
+        run: python scripts/free_proxy_sources.py
+      - name: 生成每日资料页与日期目录
+        run: python scripts/build_free_proxy_pages.py
       - name: 发布本次检查结果
         shell: bash
         run: |
           set -euo pipefail
-          git add -- data/upstream.json CATALOG.md UPDATES.md
+          git add -- data/upstream.json CATALOG.md UPDATES.md data/free-proxy-sources.json free-proxies/
           if git diff --cached --quiet; then
             echo '内容未变化，无需提交。'
             exit 0
@@ -82,5 +90,5 @@ jobs:
           git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               -c commit.gpgSign=false \
-              commit -m '自动检查上游版本与项目状态'
+              commit -m '更新工具版本与每日免费代理资料'
           git push origin HEAD:main

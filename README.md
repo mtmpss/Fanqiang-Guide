@@ -1,6 +1,6 @@
 # 翻墙指南 · 科学上网工具与路由器知识库
 
-[fanqiang.guide](https://fanqiang.guide) ｜ [全部工具](CATALOG.md) ｜ [软件版本与项目动态](UPDATES.md)
+[fanqiang.guide](https://fanqiang.guide) ｜ [全部工具](CATALOG.md) ｜ [软件版本与项目动态](UPDATES.md) ｜ [每日免费节点与代理](free-proxies/)
 
 按你的设备查找翻墙工具，了解客户端、代理协议、华硕梅林和 OpenWrt。点击工具名称可查看中文介绍与官方资料。
 
